@@ -61,3 +61,126 @@
 # {'type': 'metrics', 'dataset': 'train', 'r2': 0.8, 'mse': 0.7, 'mad': 0.9}
 # {'type': 'metrics', 'dataset': 'test', 'r2': 0.7, 'mse': 0.6, 'mad': 0.8}
 #
+from sklearn.feature_selection import SelectKBest, f_regression
+from sklearn.preprocessing import MinMaxScaler
+import os
+from glob import glob
+from sklearn.linear_model import LinearRegression
+import pandas as pd
+import gzip
+import pickle
+import json
+from sklearn.pipeline import Pipeline
+from sklearn.metrics import r2_score, mean_squared_error, median_absolute_error
+from sklearn.model_selection import GridSearchCV
+from sklearn.compose import ColumnTransformer
+from sklearn.preprocessing import OneHotEncoder
+
+def load_data(train_path, test_path):
+    train_df = pd.read_csv(train_path, index_col=False, compression="zip")
+    test_df = pd.read_csv(test_path, index_col=False, compression="zip")
+    return train_df, test_df
+
+def preprocess_data(train_df, test_df):
+    reference_year = 2021
+    
+    train_clean = train_df.copy()
+    test_clean = test_df.copy()
+    
+    for df in [train_clean, test_clean]:
+        df["Age"] = reference_year - df["Year"]
+        df.drop(columns=['Year', 'Car_Name'], inplace=True)
+    
+    return train_clean.dropna(), test_clean.dropna()
+
+def create_model_pipeline(categorical_features, numerical_features):
+    """Create preprocessing and model pipeline"""
+    preprocessor = ColumnTransformer(
+        transformers=[
+            ('categorical', OneHotEncoder(), categorical_features),
+            ('scaling', MinMaxScaler(), numerical_features),
+        ]
+    )
+    
+    return Pipeline([
+        ("data_preprocessor", preprocessor),
+        ('feature_selector', SelectKBest(score_func=f_regression)),
+        ('regressor', LinearRegression())
+    ])
+
+def calculate_metrics(y_true, y_pred, dataset_type):
+    return {
+        "type": "metrics",
+        "dataset": dataset_type,
+        "r2": float(r2_score(y_true, y_pred)),
+        "mse": float(mean_squared_error(y_true, y_pred)),
+        "mad": float(median_absolute_error(y_true, y_pred))
+    }
+
+def main():
+    # Load and prepare data
+    train_df, test_df = load_data(
+        "./files/input/train_data.csv.zip",
+        "./files/input/test_data.csv.zip"
+    )
+    
+    train_clean, test_clean = preprocess_data(train_df, test_df)
+    
+    # Split features and target
+    x_train = train_clean.drop(columns=["Present_Price"])
+    y_train = train_clean["Present_Price"]
+    x_test = test_clean.drop(columns=["Present_Price"])
+    y_test = test_clean["Present_Price"]
+    
+    categorical_cols = ['Fuel_Type', 'Selling_type', 'Transmission']
+    numerical_cols = [col for col in x_train.columns if col not in categorical_cols]
+    
+    # Create and configure pipeline
+    pipeline = create_model_pipeline(categorical_cols, numerical_cols)
+    
+   
+    param_grid = {
+        'feature_selector__k': range(1, 25),
+        'regressor__fit_intercept': [True, False],
+        'regressor__positive': [True, False]
+    }
+    
+    # Perform grid search
+    model = GridSearchCV(
+        estimator=pipeline,
+        param_grid=param_grid,
+        cv=10,
+        scoring='neg_mean_absolute_error',
+        n_jobs=-1,
+        refit=True,
+        verbose=1
+    )
+    
+    model.fit(x_train, y_train)
+    
+    # Save model
+    if os.path.exists("files/models/"):
+        for file in glob(f"files/models/*"):
+            os.remove(file)
+        os.rmdir("files/models/")
+    os.makedirs("files/models/")
+    
+    with gzip.open("files/models/model.pkl.gz", "wb") as f:
+        pickle.dump(model, f)
+    
+    
+    y_train_pred = model.predict(x_train)
+    y_test_pred = model.predict(x_test)
+    
+   
+    train_metrics = calculate_metrics(y_train, y_train_pred, "train")
+    test_metrics = calculate_metrics(y_test, y_test_pred, "test")
+    
+    # Save results
+    os.makedirs("files/output/", exist_ok=True)
+    with open("files/output/metrics.json", "w", encoding="utf-8") as file:
+        file.write(json.dumps(train_metrics) + "\n")
+        file.write(json.dumps(test_metrics) + "\n")
+
+if __name__ == "__main__":
+    main()
